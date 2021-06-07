@@ -796,6 +796,7 @@ future<> server_impl::wait_election_done() {
 
 future<> server_impl::wait_log_idx_term(std::pair<index_t, term_t> idx_log) {
     while (_fsm->log_last_term() < idx_log.second || _fsm->log_last_idx() < idx_log.first) {
+fmt::print("  wait_log_idx_term({})\n", _id);
         co_await seastar::sleep(5us);
     }
 }

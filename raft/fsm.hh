@@ -487,6 +487,7 @@ void fsm::step(server_id from, Message&& msg) {
     if (msg.current_term > _current_term) {
         server_id leader{};
 
+if (_my_id.id.get_least_significant_bits() < 3) fmt::print("{} [term: {}] received a message with higher term from {} [term: {}]\n", _my_id, _current_term, from, msg.current_term);
         logger.trace("{} [term: {}] received a message with higher term from {} [term: {}]",
             _my_id, _current_term, from, msg.current_term);
 
@@ -512,6 +513,7 @@ void fsm::step(server_id from, Message&& msg) {
                     // update its term or grant its vote.
                     // Unless `force` flag is set which indicates that the current leader
                     // wants to stepdown.
+if (_my_id.id.get_least_significant_bits() < 3) fmt::print("{} [term: {}] not granting a vote within a minimum election timeout, elapsed {} (current leader = {})\n", _my_id, _current_term, election_elapsed(), current_leader());
                     logger.trace("{} [term: {}] not granting a vote within a minimum election timeout, elapsed {} (current leader = {})",
                         _my_id, _current_term, election_elapsed(), current_leader());
                     return;
@@ -532,6 +534,7 @@ void fsm::step(server_id from, Message&& msg) {
         }
 
         if (!ignore_term) {
+if (_my_id.id.get_least_significant_bits() < 3) fmt::print("  {} step become follower leader {}\n", _my_id, leader);
             become_follower(leader);
             update_current_term(msg.current_term);
         }
@@ -564,6 +567,7 @@ void fsm::step(server_id from, Message&& msg) {
                 // leader’s term (included in its RPC) is at least as large as the
                 // candidate’s current term, then the candidate recognizes the
                 // leader as legitimate and returns to follower state.
+if (_my_id.id.get_least_significant_bits() < 3) fmt::print("  {} step msg same term we candidate, become follower leader\n", _my_id);
                 become_follower(from);
             } else if (current_leader() == server_id{}) {
                 // Earlier we changed our term to match a candidate's

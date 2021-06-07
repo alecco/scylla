@@ -142,12 +142,18 @@ struct leader {
 };
 using partition = std::vector<std::variant<leader,int>>;
 
-// Disconnect 2 servers both ways
-struct two_nodes {
+// Disconnect servers from the rest of the cluster
+struct disconnect {
+    std::vector<size_t> nodes;
+    disconnect(size_t node) : nodes({node}) {};
+    disconnect(std::vector<size_t> nodes) : nodes({nodes}) {};
+};
+
+// Disconnect servers from each other
+struct disconnect_pair {
     size_t first;
     size_t second;
 };
-struct disconnect : public two_nodes {};
 
 struct stop {
     size_t id;
@@ -213,7 +219,8 @@ struct tick {
     uint64_t ticks;
 };
 
-using update = std::variant<entries, new_leader, partition, disconnect, stop, reset, wait_log,
+using update = std::variant<entries, new_leader, partition, disconnect, disconnect_pair,
+      stop, reset, wait_log,
       set_config, check_rpc_config, check_rpc_added, check_rpc_removed, rpc_reset_counters,
       tick>;
 
@@ -344,6 +351,7 @@ public:
     future<> stop(::stop server);
     future<> reset(::reset server);
     void disconnect(::disconnect nodes);
+    void disconnect_pair(::disconnect_pair nodes);
     void verify();
 private:
     test_server create_server(size_t id, initial_state state);
@@ -702,9 +710,12 @@ future<> raft_cluster::stop_all() {
 }
 
 future<> raft_cluster::wait_all() {
+fmt::print("  wait_all()  total {}\n", _in_configuration.size());
     for (auto s: _in_configuration) {
+if (s < 10 || s == _in_configuration.size() - 1) fmt::print("  waiting {}\n", s);
         co_await _servers[s].sm->done();
     }
+fmt::print("  wait_all() done\n", _in_configuration.size());
 }
 
 void raft_cluster::tick_all() {
@@ -723,18 +734,24 @@ void raft_cluster::connect_all() {
 
 // Add consecutive integer entries to a leader
 future<> raft_cluster::add_entries(size_t n) {
+fmt::print("  add_entries({}) leader {}\n", n, _leader);
     size_t end = _next_val + n;
     while (_next_val != end) {
         try {
+fmt::print("      add_entry({}) on leader {}\n", _next_val, _leader);
             co_await _servers[_leader].server->add_entry(create_command(_next_val), raft::wait_type::committed);
             _next_val++;
         } catch (raft::not_a_leader& e) {
+fmt::print("      {} not a leader (leader {})\n", _leader, to_local_id(e.leader.id));
             // leader stepped down, update with new leader if present
             if (e.leader != raft::server_id{}) {
+fmt::print("           updating leader to {}\n", to_local_id(e.leader.id));
                 _leader = to_local_id(e.leader.id);
             }
         } catch (raft::commit_status_unknown& e) {
+fmt::print("      commit status unknown\n");
         } catch (raft::dropped_entry& e) {
+fmt::print("      dropped entry\n");
             // retry if an entry is dropped because the leader have changed after it was submitetd
         }
     }
@@ -813,17 +830,20 @@ size_t apply_changes(raft::server_id id, const std::vector<raft::command_cref>& 
 
 // Wait for leader log to propagate to follower
 future<> raft_cluster::wait_log(size_t follower) {
+fmt::print("  wait_log({}) leader {}\n", follower, _leader);
     if ((*_connected)(to_raft_id(_leader), to_raft_id(follower)) &&
            _in_configuration.contains(_leader) && _in_configuration.contains(follower)) {
         auto leader_log_idx_term = _servers[_leader].server->log_last_idx_term();
         co_await _servers[follower].server->wait_log_idx_term(leader_log_idx_term);
     }
+else fmt::print("  {} not in config or connected, now wait_log\n", to_raft_id(follower));
 }
 
 // Wait for leader log to propagate to specified followers
 future<> raft_cluster::wait_log(::wait_log followers) {
     auto leader_log_idx_term = _servers[_leader].server->log_last_idx_term();
     for (auto s: followers.local_ids) {
+fmt::print("  wait_log({}) leader {}\n", s, _leader);
         co_await _servers[s].server->wait_log_idx_term(leader_log_idx_term);
     }
 }
@@ -831,6 +851,7 @@ future<> raft_cluster::wait_log(::wait_log followers) {
 // Wait for all connected followers to catch up
 future<> raft_cluster::wait_log_all() {
     auto leader_log_idx_term = _servers[_leader].server->log_last_idx_term();
+fmt::print("  wait_log_all  total {}\n", _servers.size());
     for (size_t s = 0; s < _servers.size(); ++s) {
         if (s != _leader && (*_connected)(to_raft_id(s), to_raft_id(_leader)) &&
                 _in_configuration.contains(s)) {
@@ -1110,6 +1131,12 @@ future<> raft_cluster::reset(::reset server) {
 }
 
 void raft_cluster::disconnect(::disconnect nodes) {
+    for (auto node: nodes.nodes) {
+        _connected->disconnect(to_raft_id(node));
+    }
+}
+
+void raft_cluster::disconnect_pair(::disconnect_pair nodes) {
     _connected->cut(to_raft_id(nodes.first), to_raft_id(nodes.second));
 }
 
@@ -1166,23 +1193,33 @@ std::vector<initial_state> raft_cluster::get_states(test_case test, bool prevote
 
 future<> run_test(test_case test, bool prevote, bool packet_drops) {
 
+fmt::print("  creating cluster\n");
     raft_cluster rafts(test, apply_changes, test.total_values,
             test.get_first_val(), test.initial_leader, prevote, packet_drops);
+fmt::print("  starting cluster\n");
     co_await rafts.start_all();
 
+fmt::print("  processing updates\n");
     BOOST_TEST_MESSAGE("Processing updates");
 
     // Process all updates in order
     for (auto update: test.updates) {
         co_await std::visit(make_visitor(
         [&rafts] (entries update) -> future<> {
+fmt::print("  entries {}\n", update.n);
             co_await rafts.add_entries(update.n);
         },
         [&rafts] (new_leader update) -> future<> {
+fmt::print("  new_leader {}\n", update.id);
             co_await rafts.elect_new_leader(update.id);
         },
         [&rafts] (disconnect update) -> future<> {
+fmt::print("  disconnect nodes {}\n", update.nodes);
             rafts.disconnect(update);
+            co_return;
+        },
+        [&rafts] (disconnect_pair update) -> future<> {
+            rafts.disconnect_pair(update);
             co_return;
         },
         [&rafts] (partition update) -> future<> {
@@ -1222,17 +1259,23 @@ future<> run_test(test_case test, bool prevote, bool packet_drops) {
     }
 
     // Reconnect and bring all nodes back into configuration, if needed
+fmt::print("  connect all\n");
     rafts.connect_all();
+fmt::print("  configure all\n");
     co_await rafts.reconfigure_all();
 
     if (test.total_values > 0) {
         BOOST_TEST_MESSAGE("Appending remaining values");
+fmt::print("  remaining values\n");
         co_await rafts.add_remaining_entries();
+fmt::print("  wait all\n");
         co_await rafts.wait_all();
     }
 
+fmt::print("  stopping\n");
     co_await rafts.stop_all();
 
+fmt::print("  verifying\n");
     if (test.total_values > 0) {
         rafts.verify();
     }
@@ -1462,6 +1505,17 @@ SEASTAR_THREAD_TEST_CASE(test_leader_change_during_snapshot_transfere) {
          .updates = {tick{10} /* ticking starts snapshot transfer */, new_leader{1}, entries{10}}}
     , false, false);
 }
+
+// 1000 nodes, add entries, drop leader, add entries [implicit re-join all]
+RAFT_TEST_CASE(many_01, (test_case{
+         .nodes = 500,
+         .total_values = 20, // XXX
+         .updates = {entries{4},
+                     wait_log{1},disconnect{0},new_leader{1},entries{4},
+                     // wait_log{0}
+                     // XXX boom 0 becomes candidate and doesn't yield
+                     }}));
+
 
 // verifies that each node in a cluster can campaign
 // and be elected in turn. This ensures that elections work when not
