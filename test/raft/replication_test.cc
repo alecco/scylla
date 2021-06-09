@@ -848,34 +848,67 @@ future<> raft_cluster::elect_new_leader(size_t new_leader) {
             format("Wrong next leader value {}", new_leader));
 
     if (new_leader != _leader) {
-        do {
-            if ((*_connected)(to_raft_id(_leader), to_raft_id(new_leader))) {
-                co_await wait_log(new_leader);
-            }
+        bool both_connected = (*_connected)(to_raft_id(_leader), to_raft_id(new_leader));
+fmt::print(" elect_new_leader() both_connected {}\n", both_connected? "YES" : "NO");
+fmt::print(" elect_new_leader() {} -> {}\n", to_raft_id(_leader), to_raft_id(new_leader));
+        if (both_connected) {
+fmt::print(" elect_new_leader() wait_log({})\n", to_raft_id(new_leader));
+            co_await wait_log(new_leader);
+        }
 
-            pause_tickers();
-            // Leader could be already partially disconnected, save current connectivity state
-            struct connected prev_disconnected = *_connected;
-            // Disconnect current leader from everyone
-            _connected->disconnect(to_raft_id(_leader));
-            // Make move all nodes past election threshold, also making old leader follower
-            elapse_elections();
+        // Leader could be already partially disconnected, save current connectivity state
+        struct connected prev_disconnected = *_connected;
+        // Disconnect current leader from everyone
+        _connected->disconnect(to_raft_id(_leader));
+
+        // Make move all nodes past election threshold, also making old leader follower
+        pause_tickers();
+        elapse_elections();
+fmt::print(" elect_new_leader() elapsed elections\n");
+
+        do {
+fmt::print(" elect_new_leader() loop start -------------------\n");
+            // XXX leader is disconnected from everyone
+
+            // XXX do not tick inside so no other server can become candidate and leader
+
             // Consume leader output messages since a stray append might make new leader step down
             co_await later();                 // yield
-            _servers[new_leader].server->wait_until_candidate();
-            // Re-connect old leader
-            _connected->connect(to_raft_id(_leader));
-            // Disconnect old leader from all nodes except new leader
-            _connected->disconnect(to_raft_id(_leader), to_raft_id(new_leader));
-            restart_tickers();
-            co_await _servers[new_leader].server->wait_election_done();
 
-            // Restore connections to the original setting
-            *_connected = prev_disconnected;
+fmt::print(" elect_new_leader() wait_until_candidate...\n");
+            _servers[new_leader].server->wait_until_candidate();
+
+            if (both_connected) {
+                // Allow old leader to vote for new candidate while not looking alive to others
+                // Re-connect old leader
+                _connected->connect(to_raft_id(_leader));
+                // Disconnect old leader from all nodes except new leader
+fmt::print(" elect_new_leader() reconnecting old leader with candidate\n");
+                _connected->disconnect(to_raft_id(_leader), to_raft_id(new_leader));
+            }
+fmt::print(" elect_new_leader() wait_election_done...\n");
+            co_await _servers[new_leader].server->wait_election_done();
+#if 0
+fmt::print(" elect_new_leader() tick new_leader\n");
+            _servers[new_leader].server->tick();
+fmt::print(" elect_new_leader() tick old leader\n");
+            _servers[_leader].server->tick();
+#endif
+
+            // XXX for next loop
+            if (both_connected) {
+                _connected->disconnect(to_raft_id(_leader));
+            }
+// co_await seastar::sleep(300ms);   // Wait for election rpc exchanges
         } while (!_servers[new_leader].server->is_leader());
         tlogger.debug("confirmed leader on {}", to_raft_id(new_leader));
+        _leader = new_leader;
+
+        // Restore connections to the original setting
+        *_connected = prev_disconnected;
+
+        restart_tickers();
     }
-    _leader = new_leader;
 }
 
 // Run a free election of nodes in configuration
